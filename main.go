@@ -2,11 +2,17 @@ package main
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/md5"
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"os"
+
+	"golang.org/x/term"
 
 	"gocloud.dev/blob"
 	_ "gocloud.dev/blob/azureblob"
@@ -18,11 +24,26 @@ import (
 
 func main() {
 	var useMem bool
+	var passEncrypt bool
+	var passDecrypt bool
 	flag.BoolVar(&useMem, "use-mem", false, "use a memory bucket to calculate MD5s")
+	flag.BoolVar(&passEncrypt, "encrypt", false, "encrypt the data with the given key")
+	flag.BoolVar(&passDecrypt, "decrypt", false, "decrypt the data with the given key")
 	flag.Parse()
 	if len(flag.Args()) != 2 {
-		usage()
+		log.Fatal("src and dst arguments are required")
 	}
+	var bytesEncrypt []byte
+	var bytesDecrypt []byte
+	if passEncrypt {
+		bytesEncrypt = getAuthentication()
+		useMem = true
+	}
+	if passDecrypt {
+		bytesDecrypt = getAuthentication()
+		useMem = true
+	}
+
 	src := flag.Arg(0)
 	dst := flag.Arg(1)
 
@@ -39,23 +60,13 @@ func main() {
 	}
 	defer dbkt.Close()
 
-	if err := mirror(ctx, sbkt, dbkt, useMem); err != nil {
+	if err := mirror(ctx, sbkt, dbkt, useMem, bytesEncrypt, bytesDecrypt); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func usage() {
-	fmt.Fprintf(os.Stderr, "usage: %s [flags] <src> <dst>\n", os.Args[0])
-	flag.PrintDefaults()
-	fmt.Fprintf(os.Stderr, "consider using --mem to calculate local md5s using an in-memory blob prior to copy\n")
-	fmt.Fprintf(os.Stderr, "example: %s --mem file:///tmp/foo gs://my-bucket/bar\n", os.Args[0])
-	fmt.Fprintf(os.Stderr, "undocumented driver-specific flags can be passed to the urlstring\n")
-	fmt.Fprintf(os.Stderr, "example: %s gs://my-bucket/bar 'file:////restore/to/foo?no_tmp_dir=1&create_dir=1'\n", os.Args[0])
-	os.Exit(2)
-}
-
 // copies all objects from src to dst.
-func mirror(ctx context.Context, sbkt, dbkt *blob.Bucket, useMem bool) error {
+func mirror(ctx context.Context, sbkt, dbkt *blob.Bucket, useMem bool, bytesEncrypt, bytesDecrypt []byte) error {
 	tmpBkt, err := blob.OpenBucket(ctx, "mem://")
 	if err != nil {
 		return err
@@ -80,30 +91,33 @@ func mirror(ctx context.Context, sbkt, dbkt *blob.Bucket, useMem bool) error {
 		// and this will calculate the MD5 for us.
 		// csbkt and sattrs will be updated to point to the temporary bucket in that case.
 		csbkt := sbkt
-		if sattrs.MD5 == nil && useMem {
+		objKey := obj.Key
+		if useMem {
 			log.Println("loading to memory", obj.Key)
-			_, err := copyObj(ctx, sbkt, tmpBkt, obj.Key)
+			_, newKey, err := copyObj(ctx, sbkt, tmpBkt, obj.Key, bytesEncrypt, bytesDecrypt)
 			if err != nil {
 				return err
 			}
 			csbkt = tmpBkt
-			sattrs, _ = csbkt.Attributes(ctx, obj.Key)
+			sattrs, _ = csbkt.Attributes(ctx, newKey)
+			objKey = newKey
 			cleanloop = func() {
 				log.Println("unloading from memory", obj.Key)
-				if err := tmpBkt.Delete(ctx, obj.Key); err != nil {
+				if err := tmpBkt.Delete(ctx, newKey); err != nil {
 					log.Println("error deleting", obj.Key, "from memory bucket:", err)
 				}
 			}
 		}
+		log.Println("done copying to memory")
 
 		// check if file exists in the destination
-		exists, err := dbkt.Exists(ctx, obj.Key)
+		exists, err := dbkt.Exists(ctx, objKey)
 		if err != nil {
 			return err
 		}
 		// if it exists, check if the md5 matches
 		if exists {
-			dattrs, err := dbkt.Attributes(ctx, obj.Key)
+			dattrs, err := dbkt.Attributes(ctx, objKey)
 			if err != nil {
 				return err
 			}
@@ -112,12 +126,12 @@ func mirror(ctx context.Context, sbkt, dbkt *blob.Bucket, useMem bool) error {
 			}
 		}
 		// either it doesn't exist, or the MD5 doesn't match. copy it.
-		log.Println("copying to destination", obj.Key, "size", obj.Size)
-		n, err := copyObj(ctx, csbkt, dbkt, obj.Key)
+		log.Printf("copying to destination %s [%s] size %d\n", obj.Key, objKey, sattrs.Size)
+		n, _, err := copyObj(ctx, csbkt, dbkt, objKey, []byte{}, []byte{})
 		if err != nil {
 			return err
 		}
-		log.Println("copied to destination", obj.Key, "size", n)
+		log.Printf("copied to destination %s [%s] size %d\n", obj.Key, objKey, n)
 	}
 	return nil
 }
@@ -136,22 +150,111 @@ func matchMD5(md51, md52 []byte) bool {
 }
 
 // copy object refereced by key from src to dst buckets.
-func copyObj(ctx context.Context, src, dst *blob.Bucket, key string) (int64, error) {
+func copyObj(ctx context.Context, src, dst *blob.Bucket, key string, bytesEncrypt, bytesDecrypt []byte) (int, string, error) {
+	newKey := makeKey(key, bytesEncrypt, bytesDecrypt)
 	srcr, err := src.NewReader(ctx, key, nil)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	defer srcr.Close()
 
-	dstw, err := dst.NewWriter(ctx, key, nil)
+	beforeText, err := io.ReadAll(srcr)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
-	defer dstw.Close()
+	newText := encrypt(beforeText, bytesEncrypt)
+	newText = decrypt(newText, bytesDecrypt)
 
-	n, err := dstw.ReadFrom(srcr)
+	dstw, err := dst.NewWriter(ctx, newKey, nil)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
-	return n, nil
+
+	n, err := dstw.Write(newText)
+	if err != nil {
+		return 0, "", err
+	}
+	return n, newKey, dstw.Close()
+}
+
+func encrypt(text []byte, key []byte) []byte {
+	if len(key) == 0 {
+		return text
+	}
+	c, err := aes.NewCipher(key)
+	if err != nil {
+		log.Fatal(err)
+	}
+	gcm, err := cipher.NewGCM(c)
+	if err != nil {
+		log.Fatal(err)
+	}
+	// this is not secure.
+	// doing this so we have a consistent hash and filename for the same input
+	md5sum := md5.Sum(text)
+	nonce := md5sum[:gcm.NonceSize()]
+	return gcm.Seal(nonce, nonce, text, nil)
+}
+
+func decrypt(cyphertext []byte, key []byte) []byte {
+	if len(key) == 0 {
+		return cyphertext
+	}
+	c, err := aes.NewCipher(key)
+	if err != nil {
+		log.Fatal(err)
+	}
+	gcm, err := cipher.NewGCM(c)
+	if err != nil {
+		log.Fatal(err)
+	}
+	nonceSize := gcm.NonceSize()
+	nonce, cyphertext := cyphertext[:nonceSize], cyphertext[nonceSize:]
+	text, err := gcm.Open(nil, nonce, cyphertext, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return text
+}
+
+func makeKey(oldKey string, bytesEncrypt, bytesDecrypt []byte) string {
+	newKey := oldKey
+	if len(bytesEncrypt) != 0 {
+		encryptedKey := encrypt([]byte(newKey), bytesEncrypt)
+		newKey = base64.URLEncoding.EncodeToString(encryptedKey)
+	}
+	if len(bytesDecrypt) != 0 {
+		decodedKey, err := base64.URLEncoding.DecodeString(newKey)
+		if err != nil {
+			log.Fatal(err)
+		}
+		decryptedKey := decrypt(decodedKey, bytesDecrypt)
+		newKey = string(decryptedKey)
+	}
+	return newKey
+}
+
+func getAuthentication() []byte {
+	pass, ok := os.LookupEnv("BLOBCOPY_ENCRYPTION_PASSWORD")
+	if !ok {
+		fmt.Println("Enter Password:")
+		bytepass1, err := term.ReadPassword(int(os.Stdin.Fd()))
+		if err != nil {
+			log.Fatal(err)
+		}
+		pass1 := string(bytepass1)
+		fmt.Println("Enter it one more time:")
+		bytepass2, err := term.ReadPassword(int(os.Stdin.Fd()))
+		if err != nil {
+			log.Fatal(err)
+		}
+		pass2 := string(bytepass2)
+		if pass1 != pass2 {
+			log.Fatal("passwords don't match")
+		}
+		pass = string(pass1)
+	}
+	md5sum := md5.Sum([]byte(pass))
+	md5sum2 := md5.Sum(md5sum[:])
+	return append(md5sum2[:], md5sum[:]...)
 }

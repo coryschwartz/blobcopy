@@ -2,7 +2,10 @@ module github.com/coryschwartz/blobcopy
 
 go 1.21.4
 
-require gocloud.dev v0.34.0
+require (
+	gocloud.dev v0.34.0
+	golang.org/x/term v0.10.0
+)
 
 require (
 	cloud.google.com/go v0.110.7 // indirect
