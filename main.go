@@ -83,33 +83,36 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if err := mirror(ctx, sbkt, dbkt, tmpBkt, bytesEncrypt, bytesDecrypt, skipN); err != nil {
+	n, err := mirror(ctx, sbkt, dbkt, tmpBkt, bytesEncrypt, bytesDecrypt, skipN)
+	if err != nil {
 		log.Fatal(err)
 	}
+	log.Printf("copied %d objects.\n", n)
 }
 
 // copies all objects from src to dst.
-func mirror(ctx context.Context, sbkt, dbkt, tmpBkt *blob.Bucket, bytesEncrypt, bytesDecrypt []byte, skipN int) error {
+func mirror(ctx context.Context, sbkt, dbkt, tmpBkt *blob.Bucket, bytesEncrypt, bytesDecrypt []byte, skipN int) (int, error) {
 	iter := sbkt.List(nil)
 	// cleanloop won't run on the last iteration, but that's fine.
 	cleanloop := func() {}
 	loopN := 0
+	addedN := 0
 	for {
-		loopN++
-		if loopN <= skipN {
-			continue
-		}
 		cleanloop()
+		loopN++
 		obj, err := iter.Next(ctx)
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return err
+			return addedN, err
+		}
+		if loopN <= skipN {
+			continue
 		}
 		sattrs, err := sbkt.Attributes(ctx, obj.Key)
 		if err != nil {
-			return err
+			return addedN, err
 		}
 		// if we're using a memory bucket, first copy the object to the memory bucket
 		// and this will calculate the MD5 for us.
@@ -120,7 +123,7 @@ func mirror(ctx context.Context, sbkt, dbkt, tmpBkt *blob.Bucket, bytesEncrypt, 
 			log.Printf("[%d] loading to temporary bucket %s\n", loopN, obj.Key)
 			_, newKey, err := copyObj(ctx, sbkt, tmpBkt, obj.Key, bytesEncrypt, bytesDecrypt)
 			if err != nil {
-				return err
+				return addedN, err
 			}
 			csbkt = tmpBkt
 			sattrs, _ = csbkt.Attributes(ctx, newKey)
@@ -136,13 +139,13 @@ func mirror(ctx context.Context, sbkt, dbkt, tmpBkt *blob.Bucket, bytesEncrypt, 
 		// check if file exists in the destination
 		exists, err := dbkt.Exists(ctx, objKey)
 		if err != nil {
-			return err
+			return addedN, err
 		}
 		// if it exists, check if the md5 matches
 		if exists {
 			dattrs, err := dbkt.Attributes(ctx, objKey)
 			if err != nil {
-				return err
+				return addedN, err
 			}
 			if matchMD5(sattrs.MD5, dattrs.MD5) {
 				continue
@@ -152,11 +155,12 @@ func mirror(ctx context.Context, sbkt, dbkt, tmpBkt *blob.Bucket, bytesEncrypt, 
 		log.Printf("[%d] copying to destination %s [%s] size %d\n", loopN, obj.Key, objKey, sattrs.Size)
 		n, _, err := copyObj(ctx, csbkt, dbkt, objKey, []byte{}, []byte{})
 		if err != nil {
-			return err
+			return addedN, err
 		}
+		addedN++
 		log.Printf("[%d] copied to destination %s [%s] size %d\n", loopN, obj.Key, objKey, n)
 	}
-	return nil
+	return addedN, nil
 }
 
 // matchMD5 returns true if md51 and md52 are equal.
@@ -301,7 +305,7 @@ func getAuthentication() ([]byte, error) {
 		}
 		pass2 := string(bytepass2)
 		if pass1 != pass2 {
-			terminal.Write([]byte("Passwords do not match\n"))
+			_, _ = terminal.Write([]byte("Passwords do not match\n"))
 			return nil, ErrPasswordMismatch
 		}
 		pass = string(pass1)
