@@ -6,8 +6,8 @@ import (
 	"crypto/cipher"
 	"crypto/md5"
 	"encoding/base64"
+	"errors"
 	"flag"
-	"fmt"
 	"io"
 	"log"
 	"os"
@@ -22,26 +22,41 @@ import (
 	_ "gocloud.dev/blob/s3blob"
 )
 
+var (
+	ErrPasswordMismatch = errors.New("passwords do not match")
+)
+
 func main() {
-	var useMem bool
+	var useTmp string
 	var passEncrypt bool
 	var passDecrypt bool
-	flag.BoolVar(&useMem, "use-mem", false, "use a memory bucket to calculate MD5s")
+	var skipN int
+	flag.StringVar(&useTmp, "tmp-bkt", "", "use a temporary bucket -- can be useful for calculating md5s")
+	flag.IntVar(&skipN, "skip", 0, "skip the first N files")
 	flag.BoolVar(&passEncrypt, "encrypt", false, "encrypt the data with the given key")
 	flag.BoolVar(&passDecrypt, "decrypt", false, "decrypt the data with the given key")
 	flag.Parse()
 	if len(flag.Args()) != 2 {
 		log.Fatal("src and dst arguments are required")
 	}
+	var bytesAuth []byte
 	var bytesEncrypt []byte
 	var bytesDecrypt []byte
+	if passEncrypt || passDecrypt {
+		if useTmp == "" {
+			useTmp = "mem://"
+		}
+		var err error
+		bytesAuth, err = getAuthentication()
+		if err != nil {
+			os.Exit(1)
+		}
+	}
 	if passEncrypt {
-		bytesEncrypt = getAuthentication()
-		useMem = true
+		bytesEncrypt = bytesAuth
 	}
 	if passDecrypt {
-		bytesDecrypt = getAuthentication()
-		useMem = true
+		bytesDecrypt = bytesAuth
 	}
 
 	src := flag.Arg(0)
@@ -60,21 +75,30 @@ func main() {
 	}
 	defer dbkt.Close()
 
-	if err := mirror(ctx, sbkt, dbkt, useMem, bytesEncrypt, bytesDecrypt); err != nil {
+	var tmpBkt *blob.Bucket
+	if useTmp != "" {
+		tmpBkt, err = blob.OpenBucket(ctx, useTmp)
+	}
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if err := mirror(ctx, sbkt, dbkt, tmpBkt, bytesEncrypt, bytesDecrypt, skipN); err != nil {
 		log.Fatal(err)
 	}
 }
 
 // copies all objects from src to dst.
-func mirror(ctx context.Context, sbkt, dbkt *blob.Bucket, useMem bool, bytesEncrypt, bytesDecrypt []byte) error {
-	tmpBkt, err := blob.OpenBucket(ctx, "mem://")
-	if err != nil {
-		return err
-	}
+func mirror(ctx context.Context, sbkt, dbkt, tmpBkt *blob.Bucket, bytesEncrypt, bytesDecrypt []byte, skipN int) error {
 	iter := sbkt.List(nil)
-	// it won't run on the last iteration, but that's fine.
+	// cleanloop won't run on the last iteration, but that's fine.
 	cleanloop := func() {}
+	loopN := 0
 	for {
+		loopN++
+		if loopN <= skipN {
+			continue
+		}
 		cleanloop()
 		obj, err := iter.Next(ctx)
 		if err == io.EOF {
@@ -92,8 +116,8 @@ func mirror(ctx context.Context, sbkt, dbkt *blob.Bucket, useMem bool, bytesEncr
 		// csbkt and sattrs will be updated to point to the temporary bucket in that case.
 		csbkt := sbkt
 		objKey := obj.Key
-		if useMem {
-			log.Println("loading to memory", obj.Key)
+		if tmpBkt != nil {
+			log.Printf("[%d] loading to temporary bucket %s\n", loopN, obj.Key)
 			_, newKey, err := copyObj(ctx, sbkt, tmpBkt, obj.Key, bytesEncrypt, bytesDecrypt)
 			if err != nil {
 				return err
@@ -102,13 +126,12 @@ func mirror(ctx context.Context, sbkt, dbkt *blob.Bucket, useMem bool, bytesEncr
 			sattrs, _ = csbkt.Attributes(ctx, newKey)
 			objKey = newKey
 			cleanloop = func() {
-				log.Println("unloading from memory", obj.Key)
+				log.Printf("[%d] deleting from temporary bucket %s\n", loopN, obj.Key)
 				if err := tmpBkt.Delete(ctx, newKey); err != nil {
 					log.Println("error deleting", obj.Key, "from memory bucket:", err)
 				}
 			}
 		}
-		log.Println("done copying to memory")
 
 		// check if file exists in the destination
 		exists, err := dbkt.Exists(ctx, objKey)
@@ -126,12 +149,12 @@ func mirror(ctx context.Context, sbkt, dbkt *blob.Bucket, useMem bool, bytesEncr
 			}
 		}
 		// either it doesn't exist, or the MD5 doesn't match. copy it.
-		log.Printf("copying to destination %s [%s] size %d\n", obj.Key, objKey, sattrs.Size)
+		log.Printf("[%d] copying to destination %s [%s] size %d\n", loopN, obj.Key, objKey, sattrs.Size)
 		n, _, err := copyObj(ctx, csbkt, dbkt, objKey, []byte{}, []byte{})
 		if err != nil {
 			return err
 		}
-		log.Printf("copied to destination %s [%s] size %d\n", obj.Key, objKey, n)
+		log.Printf("[%d] copied to destination %s [%s] size %d\n", loopN, obj.Key, objKey, n)
 	}
 	return nil
 }
@@ -151,7 +174,11 @@ func matchMD5(md51, md52 []byte) bool {
 
 // copy object refereced by key from src to dst buckets.
 func copyObj(ctx context.Context, src, dst *blob.Bucket, key string, bytesEncrypt, bytesDecrypt []byte) (int, string, error) {
-	newKey := makeKey(key, bytesEncrypt, bytesDecrypt)
+	newKey, err := makeKey(key, bytesEncrypt, bytesDecrypt)
+	if err != nil {
+		return 0, "", err
+	}
+
 	srcr, err := src.NewReader(ctx, key, nil)
 	if err != nil {
 		return 0, "", err
@@ -162,8 +189,16 @@ func copyObj(ctx context.Context, src, dst *blob.Bucket, key string, bytesEncryp
 	if err != nil {
 		return 0, "", err
 	}
-	newText := encrypt(beforeText, bytesEncrypt)
-	newText = decrypt(newText, bytesDecrypt)
+
+	newText, err := encrypt(beforeText, bytesEncrypt)
+	if err != nil {
+		return 0, "", err
+	}
+
+	newText, err = decrypt(newText, bytesDecrypt)
+	if err != nil {
+		return 0, "", err
+	}
 
 	dstw, err := dst.NewWriter(ctx, newKey, nil)
 	if err != nil {
@@ -177,84 +212,101 @@ func copyObj(ctx context.Context, src, dst *blob.Bucket, key string, bytesEncryp
 	return n, newKey, dstw.Close()
 }
 
-func encrypt(text []byte, key []byte) []byte {
+func encrypt(text []byte, key []byte) ([]byte, error) {
 	if len(key) == 0 {
-		return text
+		return text, nil
 	}
 	c, err := aes.NewCipher(key)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 	gcm, err := cipher.NewGCM(c)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 	// this is not secure.
 	// doing this so we have a consistent hash and filename for the same input
 	md5sum := md5.Sum(text)
 	nonce := md5sum[:gcm.NonceSize()]
-	return gcm.Seal(nonce, nonce, text, nil)
+	return gcm.Seal(nonce, nonce, text, nil), nil
 }
 
-func decrypt(cyphertext []byte, key []byte) []byte {
+func decrypt(cyphertext []byte, key []byte) ([]byte, error) {
 	if len(key) == 0 {
-		return cyphertext
+		return cyphertext, nil
 	}
 	c, err := aes.NewCipher(key)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 	gcm, err := cipher.NewGCM(c)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 	nonceSize := gcm.NonceSize()
 	nonce, cyphertext := cyphertext[:nonceSize], cyphertext[nonceSize:]
-	text, err := gcm.Open(nil, nonce, cyphertext, nil)
-	if err != nil {
-		log.Fatal(err)
-	}
-	return text
+	return gcm.Open(nil, nonce, cyphertext, nil)
 }
 
-func makeKey(oldKey string, bytesEncrypt, bytesDecrypt []byte) string {
+func makeKey(oldKey string, bytesEncrypt, bytesDecrypt []byte) (string, error) {
 	newKey := oldKey
 	if len(bytesEncrypt) != 0 {
-		encryptedKey := encrypt([]byte(newKey), bytesEncrypt)
+		encryptedKey, err := encrypt([]byte(newKey), bytesEncrypt)
+		if err != nil {
+			return "", err
+		}
 		newKey = base64.URLEncoding.EncodeToString(encryptedKey)
 	}
 	if len(bytesDecrypt) != 0 {
 		decodedKey, err := base64.URLEncoding.DecodeString(newKey)
 		if err != nil {
-			log.Fatal(err)
+			return "", err
 		}
-		decryptedKey := decrypt(decodedKey, bytesDecrypt)
+		decryptedKey, err := decrypt(decodedKey, bytesDecrypt)
+		if err != nil {
+			return "", err
+		}
 		newKey = string(decryptedKey)
 	}
-	return newKey
+	return newKey, nil
 }
 
-func getAuthentication() []byte {
+func getAuthentication() ([]byte, error) {
 	pass, ok := os.LookupEnv("BLOBCOPY_ENCRYPTION_PASSWORD")
 	if !ok {
-		fmt.Println("Enter Password:")
-		bytepass1, err := term.ReadPassword(int(os.Stdin.Fd()))
+		oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
 		if err != nil {
-			log.Fatal(err)
+			return nil, err
+		}
+		defer func() {
+			err := term.Restore(int(os.Stdin.Fd()), oldState)
+			if err != nil {
+				log.Println("error restoring terminal state. log output may be weird.", err)
+			}
+		}()
+
+		terminal := term.NewTerminal(os.Stdin, "")
+		_, _ = terminal.Write([]byte("Enter encryption password: "))
+		bytepass1, err := term.ReadPassword(int(os.Stdin.Fd()))
+		_, _ = terminal.Write([]byte("\n"))
+		if err != nil {
+			return nil, err
 		}
 		pass1 := string(bytepass1)
-		fmt.Println("Enter it one more time:")
+		_, _ = terminal.Write([]byte("Enter encryption password (verify): "))
 		bytepass2, err := term.ReadPassword(int(os.Stdin.Fd()))
+		_, _ = terminal.Write([]byte("\n"))
 		if err != nil {
-			log.Fatal(err)
+			return nil, err
 		}
 		pass2 := string(bytepass2)
 		if pass1 != pass2 {
-			log.Fatal("passwords don't match")
+			terminal.Write([]byte("Passwords do not match\n"))
+			return nil, ErrPasswordMismatch
 		}
 		pass = string(pass1)
 	}
 	md5sum := md5.Sum([]byte(pass))
 	md5sum2 := md5.Sum(md5sum[:])
-	return append(md5sum2[:], md5sum[:]...)
+	return append(md5sum2[:], md5sum[:]...), nil
 }
