@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -24,6 +25,8 @@ import (
 
 var (
 	ErrPasswordMismatch = errors.New("passwords do not match")
+	errLogger           = log.New(os.Stderr, "", log.Flags())
+	logger              = log.New(os.Stdout, "", log.Flags())
 )
 
 func main() {
@@ -83,15 +86,31 @@ func main() {
 		log.Fatal(err)
 	}
 
-	n, err := mirror(ctx, sbkt, dbkt, tmpBkt, bytesEncrypt, bytesDecrypt, skipN)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("copied %d objects.\n", n)
+	errs := make(chan error)
+	errsN := 0
+	stopErrs := make(chan bool)
+	errsStopped := make(chan bool)
+	go func() {
+		for {
+			select {
+			case err := <-errs:
+				errLogger.Println(err)
+				errsN++
+			case <-stopErrs:
+				close(errsStopped)
+				return
+			}
+		}
+	}()
+
+	n := mirror(ctx, sbkt, dbkt, tmpBkt, bytesEncrypt, bytesDecrypt, skipN, errs)
+	close(stopErrs)
+	<-errsStopped
+	logger.Printf("copied %d objects. %d errors.\n", n, errsN)
 }
 
 // copies all objects from src to dst.
-func mirror(ctx context.Context, sbkt, dbkt, tmpBkt *blob.Bucket, bytesEncrypt, bytesDecrypt []byte, skipN int) (int, error) {
+func mirror(ctx context.Context, sbkt, dbkt, tmpBkt *blob.Bucket, bytesEncrypt, bytesDecrypt []byte, skipN int, errs chan error) int {
 	iter := sbkt.List(nil)
 	// cleanloop won't run on the last iteration, but that's fine.
 	cleanloop := func() {}
@@ -105,14 +124,16 @@ func mirror(ctx context.Context, sbkt, dbkt, tmpBkt *blob.Bucket, bytesEncrypt, 
 			break
 		}
 		if err != nil {
-			return addedN, err
+			errs <- fmt.Errorf("error iterating: %w", err)
+			continue
 		}
 		if loopN <= skipN {
 			continue
 		}
 		sattrs, err := sbkt.Attributes(ctx, obj.Key)
 		if err != nil {
-			return addedN, err
+			errs <- fmt.Errorf("unable to get attributes for %s: %w", obj.Key, err)
+			continue
 		}
 		// if we're using a memory bucket, first copy the object to the memory bucket
 		// and this will calculate the MD5 for us.
@@ -120,18 +141,19 @@ func mirror(ctx context.Context, sbkt, dbkt, tmpBkt *blob.Bucket, bytesEncrypt, 
 		csbkt := sbkt
 		objKey := obj.Key
 		if tmpBkt != nil {
-			log.Printf("[%d] loading to temporary bucket %s\n", loopN, obj.Key)
+			logger.Printf("[%d] loading to temporary bucket %s\n", loopN, obj.Key)
 			_, newKey, err := copyObj(ctx, sbkt, tmpBkt, obj.Key, bytesEncrypt, bytesDecrypt)
 			if err != nil {
-				return addedN, err
+				errs <- fmt.Errorf("error copying object to tmp bucket %s: %w", obj.Key, err)
+				continue
 			}
 			csbkt = tmpBkt
 			sattrs, _ = csbkt.Attributes(ctx, newKey)
 			objKey = newKey
 			cleanloop = func() {
-				log.Printf("[%d] deleting from temporary bucket %s\n", loopN, obj.Key)
+				logger.Printf("[%d] deleting from temporary bucket %s\n", loopN, obj.Key)
 				if err := tmpBkt.Delete(ctx, newKey); err != nil {
-					log.Println("error deleting", obj.Key, "from memory bucket:", err)
+					errs <- fmt.Errorf("error deleting %s from temporary bucket: %w", obj.Key, err)
 				}
 			}
 		}
@@ -139,28 +161,31 @@ func mirror(ctx context.Context, sbkt, dbkt, tmpBkt *blob.Bucket, bytesEncrypt, 
 		// check if file exists in the destination
 		exists, err := dbkt.Exists(ctx, objKey)
 		if err != nil {
-			return addedN, err
+			errs <- fmt.Errorf("error checking if %s exists in destination: %w", obj.Key, err)
+			continue
 		}
 		// if it exists, check if the md5 matches
 		if exists {
 			dattrs, err := dbkt.Attributes(ctx, objKey)
 			if err != nil {
-				return addedN, err
+				errs <- fmt.Errorf("error getting attributes for %s in destination: %w", obj.Key, err)
+				continue
 			}
 			if matchMD5(sattrs.MD5, dattrs.MD5) {
 				continue
 			}
 		}
 		// either it doesn't exist, or the MD5 doesn't match. copy it.
-		log.Printf("[%d] copying to destination %s [%s] size %d\n", loopN, obj.Key, objKey, sattrs.Size)
+		logger.Printf("[%d] copying to destination %s [%s] size %d\n", loopN, obj.Key, objKey, sattrs.Size)
 		n, _, err := copyObj(ctx, csbkt, dbkt, objKey, []byte{}, []byte{})
 		if err != nil {
-			return addedN, err
+			errs <- fmt.Errorf("error copying object to destination %s: %w", obj.Key, err)
+			continue
 		}
 		addedN++
-		log.Printf("[%d] copied to destination %s [%s] size %d\n", loopN, obj.Key, objKey, n)
+		logger.Printf("[%d] copied to destination %s [%s] size %d\n", loopN, obj.Key, objKey, n)
 	}
-	return addedN, nil
+	return addedN
 }
 
 // matchMD5 returns true if md51 and md52 are equal.
@@ -285,7 +310,7 @@ func getAuthentication() ([]byte, error) {
 		defer func() {
 			err := term.Restore(int(os.Stdin.Fd()), oldState)
 			if err != nil {
-				log.Println("error restoring terminal state. log output may be weird.", err)
+				errLogger.Println("error restoring terminal state. log output may be weird.", err)
 			}
 		}()
 

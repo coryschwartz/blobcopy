@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"log"
 	"strconv"
 	"testing"
 
@@ -79,10 +80,14 @@ func TestMirror(t *testing.T) {
 		}
 	}
 
-	n, err := mirror(ctx, bkt1, bkt2, nil, nil, nil, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	errs := make(chan error)
+	go func() {
+		for err := range errs {
+			log.Println(err)
+		}
+	}()
+
+	n := mirror(ctx, bkt1, bkt2, nil, nil, nil, 0, errs)
 	if n != nfiles {
 		t.Fatalf("unexpected number of objects copied. expected %d, got %d", nfiles, n)
 	}
@@ -119,10 +124,15 @@ func TestEncryptBucket(t *testing.T) {
 	}
 	defer encryptedBkt.Close()
 
-	_, err = mirror(ctx, initialBkt, encryptedBkt, nil, encKey, nil, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	errs := make(chan error)
+	go func() {
+		for err := range errs {
+			log.Println(err)
+		}
+	}()
+
+	// encrypt--------------------------------------\/
+	_ = mirror(ctx, initialBkt, encryptedBkt, nil, encKey, nil, 0, errs)
 
 	decryptedBkt, err := blob.OpenBucket(ctx, "mem://")
 	if err != nil {
@@ -130,10 +140,8 @@ func TestEncryptBucket(t *testing.T) {
 	}
 	defer decryptedBkt.Close()
 
-	_, err = mirror(ctx, encryptedBkt, decryptedBkt, nil, nil, encKey, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// decrypt ---------------------------------------------\/
+	_ = mirror(ctx, encryptedBkt, decryptedBkt, nil, nil, encKey, 0, errs)
 
 	rdr, err := decryptedBkt.NewReader(ctx, fileName, nil)
 	if err != nil {
