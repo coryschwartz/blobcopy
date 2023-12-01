@@ -158,3 +158,40 @@ func TestEncryptBucket(t *testing.T) {
 		t.Fatal("decrypted text not equal to original")
 	}
 }
+
+// Test that the safety check works.
+// enable the safety check on an encrypted bucekt
+// make sure the safety check succeeds when the same
+// encryption key is used and fails otherwise.
+func TestSafety(t *testing.T) {
+	ctx := context.Background()
+	encKey1 := testAuthentication(t)
+	encKey2 := testAuthentication(t)
+
+	bkt, err := blob.OpenBucket(ctx, "mem://")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bkt.Close()
+
+	err = enableSafetyCheck(ctx, bkt, encKey1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pass, err := safetyCheck(ctx, bkt, encKey1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pass {
+		t.Error("safety check should pass when the same key is used")
+	}
+
+	pass, err = safetyCheck(ctx, bkt, encKey2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pass {
+		t.Error("safety check should fail when a different key is used")
+	}
+}

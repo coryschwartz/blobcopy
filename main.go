@@ -13,6 +13,8 @@ import (
 	"log"
 	"os"
 
+	"gocloud.dev/gcerrors"
+
 	"golang.org/x/term"
 
 	"gocloud.dev/blob"
@@ -33,11 +35,15 @@ func main() {
 	var useTmp string
 	var passEncrypt bool
 	var passDecrypt bool
+	var useSafety bool
+	var genSafety bool
 	var skipN int
 	flag.StringVar(&useTmp, "tmp-bkt", "", "use a temporary bucket -- can be useful for calculating md5s")
 	flag.IntVar(&skipN, "skip", 0, "skip the first N files")
 	flag.BoolVar(&passEncrypt, "encrypt", false, "encrypt the data with the given key")
 	flag.BoolVar(&passDecrypt, "decrypt", false, "decrypt the data with the given key")
+	flag.BoolVar(&useSafety, "safety", false, "enable safety check")
+	flag.BoolVar(&genSafety, "gen-safety", false, "enable safety check")
 	flag.Parse()
 	if len(flag.Args()) != 2 {
 		log.Fatal("src and dst arguments are required")
@@ -77,6 +83,24 @@ func main() {
 		log.Fatal(err)
 	}
 	defer dbkt.Close()
+	if useSafety {
+		pass, err := safetyCheck(ctx, dbkt, bytesEncrypt)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if !pass {
+			log.Printf("safety check failed.")
+			if !genSafety {
+				log.Printf("use --gen-safety to generate a safety check with this password.")
+				os.Exit(1)
+			}
+			log.Printf("generating safety check.")
+			err = enableSafetyCheck(ctx, dbkt, bytesEncrypt)
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
+	}
 
 	var tmpBkt *blob.Bucket
 	if useTmp != "" {
@@ -130,6 +154,7 @@ func mirror(ctx context.Context, sbkt, dbkt, tmpBkt *blob.Bucket, bytesEncrypt, 
 		if loopN <= skipN {
 			continue
 		}
+
 		sattrs, err := sbkt.Attributes(ctx, obj.Key)
 		if err != nil {
 			errs <- fmt.Errorf("unable to get attributes for %s: %w", obj.Key, err)
@@ -171,7 +196,7 @@ func mirror(ctx context.Context, sbkt, dbkt, tmpBkt *blob.Bucket, bytesEncrypt, 
 				errs <- fmt.Errorf("error getting attributes for %s in destination: %w", obj.Key, err)
 				continue
 			}
-			if matchMD5(sattrs.MD5, dattrs.MD5) {
+			if string(sattrs.MD5) == string(dattrs.MD5) {
 				continue
 			}
 		}
@@ -186,19 +211,6 @@ func mirror(ctx context.Context, sbkt, dbkt, tmpBkt *blob.Bucket, bytesEncrypt, 
 		logger.Printf("[%d] copied to destination %s [%s] size %d\n", loopN, obj.Key, objKey, n)
 	}
 	return addedN
-}
-
-// matchMD5 returns true if md51 and md52 are equal.
-func matchMD5(md51, md52 []byte) bool {
-	if len(md51) != len(md52) {
-		return false
-	}
-	for i := range md51 {
-		if md51[i] != md52[i] {
-			return false
-		}
-	}
-	return true
 }
 
 // copy object refereced by key from src to dst buckets.
@@ -338,4 +350,61 @@ func getAuthentication() ([]byte, error) {
 	md5sum := md5.Sum([]byte(pass))
 	md5sum2 := md5.Sum(md5sum[:])
 	return append(md5sum2[:], md5sum[:]...), nil
+}
+
+// returns (unencrypted, encrypted) key names
+func safetyName(encKey []byte) (string, string, error) {
+	keySum := md5.Sum(encKey)
+	keyName := "_blobcopy_safety_" + string(keySum[:])
+	encKeyName, err := makeKey(keyName, encKey, nil)
+	if err != nil {
+		return "", "", err
+	}
+	return keyName, encKeyName, nil
+}
+
+func enableSafetyCheck(ctx context.Context, bkt *blob.Bucket, encKey []byte) error {
+	// a predictable key name that will be different for every encryption key
+	_, encKeyName, err := safetyName(encKey)
+	if err != nil {
+		return err
+	}
+	wtr, err := bkt.NewWriter(ctx, encKeyName, nil)
+	if err != nil {
+		return err
+	}
+	encContent, err := encrypt([]byte(encKeyName), encKey)
+	if err != nil {
+		return err
+	}
+	_, err = wtr.Write(encContent)
+	if err != nil {
+		return err
+	}
+	return wtr.Close()
+}
+
+func safetyCheck(ctx context.Context, bkt *blob.Bucket, encKey []byte) (bool, error) {
+	_, encKeyName, err := safetyName(encKey)
+	if err != nil {
+		return false, err
+	}
+	expectedContent, err := encrypt([]byte(encKeyName), encKey)
+	if err != nil {
+		return false, err
+	}
+	rdr, err := bkt.NewReader(ctx, encKeyName, nil)
+	switch gcerrors.Code(err) {
+	case gcerrors.NotFound:
+		return false, nil
+	case gcerrors.OK:
+		break
+	default:
+		return false, err
+	}
+	actualContent, err := io.ReadAll(rdr)
+	if err != nil {
+		return false, err
+	}
+	return string(expectedContent) == string(actualContent), nil
 }
