@@ -39,12 +39,14 @@ func main() {
 	var useSafety bool
 	var genSafety bool
 	var skipN int
+	var verifymd5 bool
 	flag.StringVar(&useTmp, "tmp-bkt", "", "use a temporary bucket -- can be useful for calculating md5s")
 	flag.IntVar(&skipN, "skip", 0, "skip the first N files")
 	flag.BoolVar(&passEncrypt, "encrypt", false, "encrypt the data with the given key")
 	flag.BoolVar(&passDecrypt, "decrypt", false, "decrypt the data with the given key")
 	flag.BoolVar(&useSafety, "safety", false, "enable safety check")
 	flag.BoolVar(&genSafety, "gen-safety", false, "enable safety check")
+	flag.BoolVar(&verifymd5, "verify-md5", false, "verify md5s of files. This may be much slower.")
 	flag.Parse()
 	if len(flag.Args()) != 2 {
 		log.Fatal("src and dst arguments are required")
@@ -129,14 +131,14 @@ func main() {
 		}
 	}()
 
-	n := mirror(ctx, sbkt, dbkt, tmpBkt, bytesEncrypt, bytesDecrypt, skipN, errs)
+	n := mirror(ctx, sbkt, dbkt, tmpBkt, bytesEncrypt, bytesDecrypt, skipN, verifymd5, errs)
 	close(stopErrs)
 	<-errsStopped
 	logger.Printf("copied %d objects. %d errors. duration: %v\n", n, errsN, time.Since(start))
 }
 
 // copies all objects from src to dst.
-func mirror(ctx context.Context, sbkt, dbkt, tmpBkt *blob.Bucket, bytesEncrypt, bytesDecrypt []byte, skipN int, errs chan error) int {
+func mirror(ctx context.Context, sbkt, dbkt, tmpBkt *blob.Bucket, bytesEncrypt, bytesDecrypt []byte, skipN int, verifymd5 bool, errs chan error) int {
 	iter := sbkt.List(nil)
 	// cleanloop won't run on the last iteration, but that's fine.
 	cleanloop := func() {}
@@ -154,6 +156,18 @@ func mirror(ctx context.Context, sbkt, dbkt, tmpBkt *blob.Bucket, bytesEncrypt, 
 			continue
 		}
 		if loopN <= skipN {
+			continue
+		}
+
+		// before we do anything else, let's see if this file already exists in the destination
+		dobjKey, err := makeKey(obj.Key, bytesEncrypt, bytesDecrypt)
+		exists, err := dbkt.Exists(ctx, dobjKey)
+		if err != nil {
+			errs <- fmt.Errorf("error checking if %s exists in destination: %w", obj.Key, err)
+			continue
+		}
+		if exists && !verifymd5 {
+			logger.Printf("%s [%s] already exists in destination, skipping with no MD5 check", obj.Key, dobjKey)
 			continue
 		}
 
@@ -185,12 +199,6 @@ func mirror(ctx context.Context, sbkt, dbkt, tmpBkt *blob.Bucket, bytesEncrypt, 
 			}
 		}
 
-		// check if file exists in the destination
-		exists, err := dbkt.Exists(ctx, objKey)
-		if err != nil {
-			errs <- fmt.Errorf("error checking if %s exists in destination: %w", obj.Key, err)
-			continue
-		}
 		// if it exists, check if the md5 matches
 		if exists {
 			dattrs, err := dbkt.Attributes(ctx, objKey)
