@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"time"
 
 	"gocloud.dev/gcerrors"
 
@@ -71,6 +72,7 @@ func main() {
 	src := flag.Arg(0)
 	dst := flag.Arg(1)
 
+	start := time.Now()
 	ctx := context.Background()
 	sbkt, err := blob.OpenBucket(ctx, src)
 	if err != nil {
@@ -130,7 +132,7 @@ func main() {
 	n := mirror(ctx, sbkt, dbkt, tmpBkt, bytesEncrypt, bytesDecrypt, skipN, errs)
 	close(stopErrs)
 	<-errsStopped
-	logger.Printf("copied %d objects. %d errors.\n", n, errsN)
+	logger.Printf("copied %d objects. %d errors. duration: %v\n", n, errsN, time.Since(start))
 }
 
 // copies all objects from src to dst.
