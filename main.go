@@ -168,6 +168,7 @@ func mirror(ctx context.Context, sbkt, dbkt, tmpBkt *blob.Bucket, bytesEncrypt, 
 		}
 		if exists && !verifymd5 {
 			logger.Printf("%s [%s] already exists in destination, skipping with no MD5 check", obj.Key, dobjKey)
+			cleanloop = func() {}
 			continue
 		}
 
